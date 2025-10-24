@@ -74,6 +74,40 @@ def _load_dir_images(
     return X_arr, y_arr
 
 
+def _resolve_cache_target(cache_setting: Any, split: str, default_dir: str) -> Any:
+    if isinstance(cache_setting, dict):
+        target = cache_setting.get(split, cache_setting.get("default", True))
+        return _resolve_cache_target(target, split, default_dir)
+
+    if cache_setting in (None, False):
+        return False
+    if cache_setting is True:
+        return True
+
+    if isinstance(cache_setting, str):
+        opt = cache_setting.strip()
+        if not opt:
+            return True
+        lowered = opt.lower()
+        if lowered in {"true", "memory", "ram"}:
+            return True
+        if lowered in {"false", "none", "off"}:
+            return False
+        if lowered in {"disk", "auto"}:
+            cache_path = os.path.join(default_dir, f"{split}.cache")
+            _ensure_dir(os.path.dirname(cache_path))
+            return cache_path
+        root, ext = os.path.splitext(opt)
+        if ext:
+            cache_path = opt
+        else:
+            cache_path = os.path.join(opt, f"{split}.cache")
+        _ensure_dir(os.path.dirname(cache_path) or opt or ".")
+        return cache_path
+
+    return True
+
+
 # -------------------------
 # Data Sources
 # -------------------------
@@ -155,6 +189,8 @@ def data_kaggle_potato_disease(cfg: Dict[str, Any]) -> DataSplits:
         - test_split: Test split ratio (default: 0.15)
         - random_state: Random seed (default: 42)
         - force_download: Force re-download even if cached (default: False)
+        - subset_fraction: Fraction of images per class (default: 1.0)
+        - max_per_class: Cap images per class (0 disables, default: 0)
     """
     from sklearn.model_selection import train_test_split
     
@@ -307,9 +343,225 @@ def data_kaggle_potato_disease(cfg: Dict[str, Any]) -> DataSplits:
     return DataSplits(X_train, y_train, X_val, y_val, X_test, y_test)
 
 
+def data_kaggle_plant_disease_all(cfg: Dict[str, Any]) -> DataSplits:
+    """Load the full Kaggle plant disease dataset covering all classes.
+
+    Mirrors the potato-specific variant but keeps every class directory found in
+    the source archive while preserving the same configuration parameters.
+
+    Config params:
+        - cache_dir: Directory to cache dataset (default: "data/plant_disease_all")
+        - img_height: Image height (default: 256)
+        - img_width: Image width (default: 256)
+        - color_mode: "rgb" or "grayscale" (default: "rgb")
+        - normalize: Normalize to [0,1] (default: True)
+        - val_split: Validation split ratio (default: 0.15)
+        - test_split: Test split ratio (default: 0.15)
+        - random_state: Random seed (default: 42)
+        - force_download: Force re-download even if cached (default: False)
+        - subset_fraction: Fraction of images per class (default: 1.0)
+        - max_images_per_class: Cap images per class (0 disables, default: 0)
+    """
+    from sklearn.model_selection import train_test_split
+
+    cache_dir: str = cfg.get("cache_dir", "data/plant_disease_all")
+    img_height: int = int(cfg.get("img_height", 256))
+    img_width: int = int(cfg.get("img_width", 256))
+    color_mode: str = cfg.get("color_mode", "rgb")
+    normalize: bool = bool(cfg.get("normalize", True))
+    val_split: float = float(cfg.get("val_split", 0.15))
+    test_split: float = float(cfg.get("test_split", 0.15))
+    random_state: int = int(cfg.get("random_state", 42))
+    force_download: bool = bool(cfg.get("force_download", False))
+    subset_fraction: float = float(cfg.get("subset_fraction", 1.0))
+    max_per_class: int = int(cfg.get("max_images_per_class", 0))
+    rng = np.random.RandomState(random_state)
+
+    image_exts = (".png", ".jpg", ".jpeg", ".bmp")
+    _ensure_dir(cache_dir)
+
+    def _list_cached_classes(path: str) -> List[str]:
+        if not os.path.isdir(path):
+            return []
+        classes: List[str] = []
+        for entry in sorted(os.listdir(path)):
+            cls_dir = os.path.join(path, entry)
+            if not os.path.isdir(cls_dir):
+                continue
+            try:
+                files = os.listdir(cls_dir)
+            except OSError:
+                continue
+            if any(
+                os.path.isfile(os.path.join(cls_dir, f))
+                and f.lower().endswith(image_exts)
+                for f in files
+            ):
+                classes.append(entry)
+        return classes
+
+    cached_class_names = _list_cached_classes(cache_dir)
+    data_ready = len(cached_class_names) > 0
+
+    if not data_ready or force_download:
+        print("Downloading Kaggle dataset...")
+        try:
+            import kagglehub
+
+            dataset_path = kagglehub.dataset_download("karagwaanntreasure/plant-disease-detection")
+            print(f"Dataset downloaded to: {dataset_path}")
+
+            plant_dir: str = ""
+            discovered_classes: List[str] = []
+            for root, dirs, _ in os.walk(dataset_path):
+                candidate_classes: List[str] = []
+                for d in dirs:
+                    full = os.path.join(root, d)
+                    if not os.path.isdir(full):
+                        continue
+                    try:
+                        entries = os.listdir(full)
+                    except OSError as exc:
+                        print(f"Warning: Cannot access {full}: {exc}")
+                        continue
+                    if any(
+                        os.path.isfile(os.path.join(full, f))
+                        and f.lower().endswith(image_exts)
+                        for f in entries
+                    ):
+                        candidate_classes.append(d)
+                if candidate_classes:
+                    plant_dir = root
+                    discovered_classes = sorted(candidate_classes)
+                    break
+
+            if not plant_dir:
+                raise ValueError(
+                    f"Could not locate class directories with images in {dataset_path}"
+                )
+
+            print(
+                f"Extracting {len(discovered_classes)} classes from {plant_dir}..."
+            )
+
+            if os.path.isdir(cache_dir):
+                shutil.rmtree(cache_dir)
+            _ensure_dir(cache_dir)
+
+            for cls in discovered_classes:
+                src_dir = os.path.join(plant_dir, cls)
+                dst_dir = os.path.join(cache_dir, cls)
+                _ensure_dir(dst_dir)
+                num_images = 0
+                for root, _, files in os.walk(src_dir):
+                    for name in files:
+                        if not name.lower().endswith(image_exts):
+                            continue
+                        src_path = os.path.join(root, name)
+                        base, ext = os.path.splitext(name)
+                        dst_path = os.path.join(dst_dir, name)
+                        suffix = 1
+                        while os.path.exists(dst_path):
+                            dst_path = os.path.join(dst_dir, f"{base}_{suffix}{ext}")
+                            suffix += 1
+                        shutil.copy2(src_path, dst_path)
+                        num_images += 1
+                if num_images == 0:
+                    print(f"  Warning: No images copied for class {cls}; removing directory")
+                    shutil.rmtree(dst_dir, ignore_errors=True)
+                else:
+                    print(f"  {cls}: {num_images} images")
+
+            cached_class_names = _list_cached_classes(cache_dir)
+            if not cached_class_names:
+                raise ValueError("No classes with images were cached. Please verify the dataset contents.")
+
+        except ImportError:
+            raise ImportError(
+                "kagglehub is required to download the dataset. Install it with: pip install kagglehub"
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to download/extract dataset: {e}")
+    else:
+        print(f"Using cached dataset from {cache_dir}")
+
+    size = (img_width, img_height)
+    X_all: List[np.ndarray] = []
+    y_all: List[int] = []
+
+    class_names = sorted(cached_class_names)
+    print(f"Loading images for {len(class_names)} classes...")
+
+    for idx, cls in enumerate(class_names):
+        cls_dir = os.path.join(cache_dir, cls)
+        if not os.path.isdir(cls_dir):
+            print(f"Warning: Skipping missing class directory: {cls_dir}")
+            continue
+
+        names = [
+            n
+            for n in os.listdir(cls_dir)
+            if os.path.isfile(os.path.join(cls_dir, n))
+            and n.lower().endswith(image_exts)
+        ]
+
+        if subset_fraction < 1.0:
+            k = max(1, int(len(names) * subset_fraction))
+            rng.shuffle(names)
+            names = names[:k]
+
+        if max_per_class > 0:
+            names = names[:max_per_class]
+
+        for name in names:
+            p = os.path.join(cls_dir, name)
+            try:
+                img = _read_image(p, size, color_mode)
+                X_all.append(img)
+                y_all.append(idx)
+            except Exception as exc:
+                print(f"Warning: Failed to read {p}: {exc}")
+
+    if len(X_all) == 0:
+        raise ValueError("No images loaded. Please check the dataset.")
+
+    X_all = np.stack(X_all, axis=0)
+    y_all = np.asarray(y_all, dtype=np.int64)
+
+    print(f"Loaded {len(X_all)} images across {len(class_names)} classes")
+
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X_all,
+        y_all,
+        test_size=test_split,
+        random_state=random_state,
+        stratify=y_all,
+    )
+
+    val_size_adjusted = val_split / (1 - test_split)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp,
+        y_temp,
+        test_size=val_size_adjusted,
+        random_state=random_state,
+        stratify=y_temp,
+    )
+
+    if normalize:
+        X_train = X_train.astype(np.float32) / 255.0
+        X_val = X_val.astype(np.float32) / 255.0
+        X_test = X_test.astype(np.float32) / 255.0
+
+    print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+    print(f"Class mapping: {dict(enumerate(class_names))}")
+
+    return DataSplits(X_train, y_train, X_val, y_val, X_test, y_test)
+
+
 register_data_source("from_directory", data_from_directory)
 register_data_source("keras_mnist", data_keras_mnist)
 register_data_source("kaggle_potato_disease", data_kaggle_potato_disease)
+register_data_source("kaggle_plant_disease_all", data_kaggle_plant_disease_all)
 
 
 # -------------------------
@@ -456,6 +708,27 @@ def build_mobilenet_v2_transfer(
         except Exception:
             pass
 
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        print("[ml][mobilenet_v2_transfer] WARNING: No GPU detected; training will run on CPU.")
+    else:
+        gpu_names = ", ".join(dev.name for dev in gpus)
+        print(f"[ml][mobilenet_v2_transfer] Using GPU(s): {gpu_names}")
+
+    try:
+        current_policy = mp.global_policy().name
+    except Exception:
+        current_policy = "unknown"
+    if bool(cfg.get("mixed_precision", False)):
+        if current_policy != "mixed_float16":
+            print(
+                f"[ml][mobilenet_v2_transfer] WARNING: Mixed precision requested but active policy is {current_policy}."
+            )
+        else:
+            print("[ml][mobilenet_v2_transfer] Mixed precision policy active: mixed_float16")
+    else:
+        print(f"[ml][mobilenet_v2_transfer] Mixed precision policy active: {current_policy}")
+
     base_input_shape = (input_shape[0], input_shape[1], 3)
     preprocess = tf.keras.applications.mobilenet_v2.preprocess_input
     base = tf.keras.applications.MobileNetV2(
@@ -563,6 +836,28 @@ def train_tfdata(
         except Exception:
             pass
 
+    try:
+        if tf.config.optimizer.get_jit():
+            print("[ml][train_tfdata] XLA JIT compilation enabled.")
+        elif bool(cfg.get("xla", False)):
+            print("[ml][train_tfdata] WARNING: XLA requested but not enabled.")
+    except Exception:
+        if bool(cfg.get("xla", False)):
+            print("[ml][train_tfdata] WARNING: Unable to query XLA status.")
+
+    gpu_devices = tf.config.list_physical_devices("GPU")
+    if not gpu_devices:
+        print("[ml][train_tfdata] WARNING: No GPU detected; training will run on CPU.")
+    else:
+        gpu_names = ", ".join(dev.name for dev in gpu_devices)
+        print(f"[ml][train_tfdata] Using GPU(s): {gpu_names}")
+
+    try:
+        policy_name = tf.keras.mixed_precision.global_policy().name
+    except Exception:
+        policy_name = "unknown"
+    print(f"[ml][train_tfdata] Mixed precision policy: {policy_name}")
+
     epochs: int = int(cfg.get("epochs", 5))
     batch_size: int = int(cfg.get("batch_size", 32))
     use_validation: bool = bool(cfg.get("use_validation", True))
@@ -571,6 +866,10 @@ def train_tfdata(
     checkpoint_path: str = cfg.get("checkpoint_path", "best_model.h5")
     buffer_size: int = int(cfg.get("shuffle_buffer", min(1000, int(splits.X_train.shape[0]) if splits.X_train.size else 1000)))
     cache = cfg.get("cache", True)
+    cache_val_override = cfg.get("cache_val", cache)
+    cache_dir = cfg.get("cache_dir", os.path.join(".tf_cache", model.name or "model_cache"))
+    _ensure_dir(cache_dir)
+
     prefetch: bool = bool(cfg.get("prefetch", True))
 
     aug_cfg: Dict[str, Any] = cfg.get("augment", {})
@@ -595,12 +894,16 @@ def train_tfdata(
             x = tf.image.random_contrast(x, lower=max(0.0, 1.0 - contrast), upper=1.0 + contrast)
         return x, y
 
+    def _apply_cache(ds: tf.data.Dataset, target: Any) -> tf.data.Dataset:
+        if target is True:
+            return ds.cache()
+        if isinstance(target, str) and target:
+            return ds.cache(target)
+        return ds
+
     ds_train = tf.data.Dataset.from_tensor_slices((splits.X_train, splits.y_train))
-    if cache:
-        if isinstance(cache, str) and len(cache) > 0:
-            ds_train = ds_train.cache(cache)
-        else:
-            ds_train = ds_train.cache()
+    train_cache_target = _resolve_cache_target(cache, "train", cache_dir)
+    ds_train = _apply_cache(ds_train, train_cache_target)
     ds_train = ds_train.shuffle(buffer_size)
     if aug_cfg:
         ds_train = ds_train.map(_map_fn, num_parallel_calls=tf.data.AUTOTUNE)
@@ -613,11 +916,15 @@ def train_tfdata(
     ds_val = None
     if use_validation and splits.X_val.size:
         ds_val = tf.data.Dataset.from_tensor_slices((splits.X_val, splits.y_val))
-        if cache:
-            if isinstance(cache, str) and len(cache) > 0:
-                ds_val = ds_val.cache(cache + "_val")
-            else:
-                ds_val = ds_val.cache()
+        val_cache_target = _resolve_cache_target(cache_val_override, "val", cache_dir)
+        if (
+            isinstance(train_cache_target, str)
+            and isinstance(val_cache_target, str)
+            and train_cache_target == val_cache_target
+        ):
+            val_cache_target = f"{val_cache_target}_val"
+            _ensure_dir(os.path.dirname(val_cache_target) or ".")
+        ds_val = _apply_cache(ds_val, val_cache_target)
         ds_val = ds_val.batch(batch_size, drop_remainder=False)
         if cfg.get("validation_steps", None) is not None:
             ds_val = ds_val.repeat()
