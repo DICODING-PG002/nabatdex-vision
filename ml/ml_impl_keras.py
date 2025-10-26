@@ -103,6 +103,22 @@ def _sanitize_label(name: str) -> str:
     return sanitized.strip("_")
 
 
+def _canonicalize_rice_label(name: str) -> str:
+    sanitized = _sanitize_label(name)
+    rice_prefix = "Rice___"
+    sanitized_lower = sanitized.lower()
+    if sanitized_lower.startswith(rice_prefix.lower()):
+        body = sanitized[len(rice_prefix) :]
+    else:
+        body = sanitized
+    parts = [part for part in body.split("_") if part]
+    if parts:
+        canonical_body = "_".join(part.capitalize() for part in parts)
+    else:
+        canonical_body = body
+    return f"{rice_prefix}{canonical_body}" if canonical_body else sanitized
+
+
 def _find_class_directory(root: str, class_name: str) -> str:
     sanitized_target = _sanitize_label(class_name).lower()
     for dirpath, dirnames, _ in os.walk(root):
@@ -553,10 +569,7 @@ def data_kaggle_plant_disease_all(cfg: Dict[str, Any]) -> DataSplits:
                 class_token = _sanitize_label(os.path.basename(root))
                 if not class_token:
                     continue
-                if class_token.lower().startswith(rice_prefix.lower()):
-                    class_name = rice_prefix + class_token[len(rice_prefix) :]
-                else:
-                    class_name = f"{rice_prefix}{class_token}"
+                class_name = _canonicalize_rice_label(class_token)
                 rice_class_sources.setdefault(class_name, []).append(root)
 
             if not rice_class_sources:
@@ -606,41 +619,60 @@ def data_kaggle_plant_disease_all(cfg: Dict[str, Any]) -> DataSplits:
     X_all: List[np.ndarray] = []
     y_all: List[int] = []
 
-    class_names = sorted(_list_cached_classes(cache_dir))
-    if not class_names:
+    cached_classes = _list_cached_classes(cache_dir)
+    if not cached_classes:
         raise ValueError("No classes with images were cached. Please verify the dataset contents.")
+
+    class_groups: Dict[str, List[str]] = {}
+    for cached_name in cached_classes:
+        if cached_name.lower().startswith("rice___"):
+            canonical = _canonicalize_rice_label(cached_name)
+        else:
+            canonical = cached_name
+        class_groups.setdefault(canonical, []).append(cached_name)
+
+    class_names = sorted(class_groups.keys())
 
     print(f"Loading images for {len(class_names)} classes...")
 
-    for idx, cls in enumerate(class_names):
-        cls_dir = os.path.join(cache_dir, cls)
-        if not os.path.isdir(cls_dir):
-            print(f"Warning: Skipping missing class directory: {cls_dir}")
+    for idx, canonical_name in enumerate(class_names):
+        grouped_dirs = class_groups[canonical_name]
+        file_paths: List[str] = []
+
+        for cls in grouped_dirs:
+            cls_dir = os.path.join(cache_dir, cls)
+            if not os.path.isdir(cls_dir):
+                print(f"Warning: Skipping missing class directory: {cls_dir}")
+                continue
+
+            current_paths = [
+                os.path.join(cls_dir, name)
+                for name in os.listdir(cls_dir)
+                if os.path.isfile(os.path.join(cls_dir, name))
+                and name.lower().endswith(image_exts)
+            ]
+
+            file_paths.extend(current_paths)
+
+        if not file_paths:
+            print(f"Warning: No images found for class {canonical_name}; skipping")
             continue
 
-        names = [
-            n
-            for n in os.listdir(cls_dir)
-            if os.path.isfile(os.path.join(cls_dir, n))
-            and n.lower().endswith(image_exts)
-        ]
-
         if subset_fraction < 1.0:
-            k = max(1, int(len(names) * subset_fraction))
-            rng.shuffle(names)
-            names = names[:k]
+            k = max(1, int(len(file_paths) * subset_fraction))
+            rng.shuffle(file_paths)
+            file_paths = file_paths[:k]
 
         if max_per_class > 0:
-            names = names[:max_per_class]
+            file_paths = file_paths[:max_per_class]
 
-        for name in names:
-            p = os.path.join(cls_dir, name)
+        for path in file_paths:
             try:
-                img = _read_image(p, size, color_mode)
+                img = _read_image(path, size, color_mode)
                 X_all.append(img)
                 y_all.append(idx)
             except Exception as exc:
-                print(f"Warning: Failed to read {p}: {exc}")
+                print(f"Warning: Failed to read {path}: {exc}")
 
     if len(X_all) == 0:
         raise ValueError("No images loaded. Please check the dataset.")
@@ -788,7 +820,6 @@ def build_sequential_cnn_mnist(
 
     for i, (f, k) in enumerate(zip(filters, kernels)):
         model.add(layers.Conv2D(f, k, padding="same", activation="relu", name=f"conv2d_{i+1}"))
-        model.add(layers.BatchNormalization(name=f"bn_{i+1}"))
         model.add(layers.MaxPooling2D(pool_size, name=f"pool_{i+1}"))
 
     model.add(layers.Flatten(name="flatten"))
@@ -1047,28 +1078,6 @@ def train_tfdata(
 
     prefetch: bool = bool(cfg.get("prefetch", True))
 
-    aug_cfg: Dict[str, Any] = cfg.get("augment", {})
-    flip_lr = bool(aug_cfg.get("flip_lr", True))
-    flip_ud = bool(aug_cfg.get("flip_ud", False))
-    rotate90 = bool(aug_cfg.get("rotate90", False))
-    bright = float(aug_cfg.get("brightness", 0.0))
-    contrast = float(aug_cfg.get("contrast", 0.0))
-
-    def _map_fn(x, y):
-        x = tf.cast(x, tf.float32)
-        if flip_lr:
-            x = tf.image.random_flip_left_right(x)
-        if flip_ud:
-            x = tf.image.random_flip_up_down(x)
-        if rotate90:
-            k = tf.random.uniform([], minval=0, maxval=4, dtype=tf.int32)
-            x = tf.image.rot90(x, k)
-        if bright > 0.0:
-            x = tf.image.random_brightness(x, max_delta=bright)
-        if contrast > 0.0:
-            x = tf.image.random_contrast(x, lower=max(0.0, 1.0 - contrast), upper=1.0 + contrast)
-        return x, y
-
     def _apply_cache(ds: tf.data.Dataset, target: Any) -> tf.data.Dataset:
         if target is True:
             return ds.cache()
@@ -1080,8 +1089,7 @@ def train_tfdata(
     train_cache_target = _resolve_cache_target(cache, "train", cache_dir)
     ds_train = _apply_cache(ds_train, train_cache_target)
     ds_train = ds_train.shuffle(buffer_size)
-    if aug_cfg:
-        ds_train = ds_train.map(_map_fn, num_parallel_calls=tf.data.AUTOTUNE)
+
     ds_train = ds_train.batch(batch_size, drop_remainder=False)
     if cfg.get("steps_per_epoch", None) is not None:
         ds_train = ds_train.repeat()
@@ -1222,25 +1230,25 @@ def export_tflite(model: tf.keras.Model, cfg: Dict[str, Any]) -> None:
     path: str = cfg.get("path", os.path.join("tflite", "model.tflite"))
     _ensure_dir(os.path.dirname(path) or ".")
     select_tf_ops: bool = bool(cfg.get("select_tf_ops", False))
-    try:
-        converter = tf.lite.TFLiteConverter.from_keras_model(model)
-        if select_tf_ops:
-            converter.target_spec.supported_ops = [
-                tf.lite.OpsSet.TFLITE_BUILTINS,
-                tf.lite.OpsSet.SELECT_TF_OPS,
-            ]
-        converter.inference_input_type = tf.float32
-        converter.inference_output_type = tf.float32
-        tflite_model = converter.convert()
-    except Exception:
-        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    if select_tf_ops:
         converter.target_spec.supported_ops = [
             tf.lite.OpsSet.TFLITE_BUILTINS,
             tf.lite.OpsSet.SELECT_TF_OPS,
         ]
-        converter.inference_input_type = tf.float32
-        converter.inference_output_type = tf.float32
+    else:
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+    converter.inference_input_type = tf.float32
+    converter.inference_output_type = tf.float32
+    try:
         tflite_model = converter.convert()
+    except Exception as exc:
+        if select_tf_ops:
+            raise RuntimeError("TFLite conversion failed even with SELECT_TF_OPS enabled.") from exc
+        raise RuntimeError(
+            "TFLite conversion failed when restricted to built-in ops. "
+            "Review model layers for TensorFlow Lite compatibility or enable 'select_tf_ops'."
+        ) from exc
     with open(path, "wb") as f:
         f.write(tflite_model)
 
