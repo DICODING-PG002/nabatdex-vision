@@ -1,6 +1,7 @@
 import os
 import math
-from typing import Any, Dict, List, Tuple
+import re
+from typing import Any, Dict, List, Tuple, Optional, Union
 import zipfile
 import shutil
 
@@ -26,6 +27,92 @@ from .ml_core import (
 def _ensure_dir(path: str) -> None:
     if path and not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
+
+
+def _compute_class_weights(y: np.ndarray) -> Dict[int, float]:
+    if y.size == 0:
+        return {}
+    classes, counts = np.unique(y, return_counts=True)
+    total = float(y.size)
+    num_classes = float(classes.size)
+    return {
+        int(cls): float(total / (num_classes * count))
+        for cls, count in zip(classes, counts)
+        if count > 0
+    }
+
+
+def _prepare_class_weight(value: Any, y: np.ndarray) -> Optional[Dict[int, float]]:
+    if value is None or value is False:
+        return None
+    if value is True or value == "balanced" or value == "auto":
+        weights = _compute_class_weights(y)
+        return weights if weights else None
+    if isinstance(value, dict):
+        return {int(k): float(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return {idx: float(w) for idx, w in enumerate(value)}
+    return None
+
+
+def _count_image_files(path: str, image_exts: Tuple[str, ...]) -> int:
+    count = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            if name.lower().endswith(image_exts):
+                count += 1
+    return count
+
+
+def _copy_image_tree(
+    src_dir: str,
+    dst_dir: str,
+    image_exts: Tuple[str, ...],
+    clear_dst: bool = False,
+) -> int:
+    if clear_dst and os.path.isdir(dst_dir):
+        shutil.rmtree(dst_dir)
+    _ensure_dir(dst_dir)
+
+    copied = 0
+    for root, _, files in os.walk(src_dir):
+        for name in files:
+            if not name.lower().endswith(image_exts):
+                continue
+            src_path = os.path.join(root, name)
+            base, ext = os.path.splitext(name)
+            dst_path = os.path.join(dst_dir, name)
+            suffix = 1
+            while os.path.exists(dst_path):
+                dst_path = os.path.join(dst_dir, f"{base}_{suffix}{ext}")
+                suffix += 1
+            shutil.copy2(src_path, dst_path)
+            copied += 1
+
+    if clear_dst and copied == 0:
+        shutil.rmtree(dst_dir, ignore_errors=True)
+
+    return copied
+
+
+def _sanitize_label(name: str) -> str:
+    sanitized = re.sub(r"[\s\-]+", "_", name.strip())
+    sanitized = re.sub(r"[^0-9A-Za-z_]", "", sanitized)
+    while "__" in sanitized:
+        sanitized = sanitized.replace("__", "_")
+    return sanitized.strip("_")
+
+
+def _find_class_directory(root: str, class_name: str) -> str:
+    sanitized_target = _sanitize_label(class_name).lower()
+    for dirpath, dirnames, _ in os.walk(root):
+        for dirname in dirnames:
+            if dirname == class_name:
+                return os.path.join(dirpath, dirname)
+        for dirname in dirnames:
+            if _sanitize_label(dirname).lower() == sanitized_target:
+                return os.path.join(dirpath, dirname)
+    return ""
 
 
 def _read_image(path: str, size: Tuple[int, int], color_mode: str) -> np.ndarray:
@@ -344,10 +431,10 @@ def data_kaggle_potato_disease(cfg: Dict[str, Any]) -> DataSplits:
 
 
 def data_kaggle_plant_disease_all(cfg: Dict[str, Any]) -> DataSplits:
-    """Load the full Kaggle plant disease dataset covering all classes.
+    """Load Kaggle plant disease data filtered to potato, tomato, and rice leaf classes.
 
-    Mirrors the potato-specific variant but keeps every class directory found in
-    the source archive while preserving the same configuration parameters.
+    Combines relevant classes from the PlantVillage dataset with the Rice Leaf
+    Diseases dataset and prepares consistent train/val/test splits.
 
     Config params:
         - cache_dir: Directory to cache dataset (default: "data/plant_disease_all")
@@ -380,6 +467,24 @@ def data_kaggle_plant_disease_all(cfg: Dict[str, Any]) -> DataSplits:
     image_exts = (".png", ".jpg", ".jpeg", ".bmp")
     _ensure_dir(cache_dir)
 
+    plant_classes = {
+        "Potato___Early_blight",
+        "Potato___Late_blight",
+        "Potato___healthy",
+        "Tomato_Bacterial_spot",
+        "Tomato_Early_blight",
+        "Tomato_Late_blight",
+        "Tomato_Leaf_Mold",
+        "Tomato_Septoria_leaf_spot",
+        "Tomato_Spider_mites_Two_spotted_spider_mite",
+        "Tomato__Target_Spot",
+        "Tomato_Tomato_YellowLeaf_Curl_Virus",
+        "Tomato__Tomato_mosaic_virus",
+        "Tomato_healthy",
+    }
+
+    allowed_prefixes = ("Potato___", "Tomato___", "Rice___")
+
     def _list_cached_classes(path: str) -> List[str]:
         if not os.path.isdir(path):
             return []
@@ -388,93 +493,105 @@ def data_kaggle_plant_disease_all(cfg: Dict[str, Any]) -> DataSplits:
             cls_dir = os.path.join(path, entry)
             if not os.path.isdir(cls_dir):
                 continue
-            try:
-                files = os.listdir(cls_dir)
-            except OSError:
-                continue
-            if any(
-                os.path.isfile(os.path.join(cls_dir, f))
-                and f.lower().endswith(image_exts)
-                for f in files
-            ):
+            if _count_image_files(cls_dir, image_exts) > 0:
                 classes.append(entry)
         return classes
 
     cached_class_names = _list_cached_classes(cache_dir)
-    data_ready = len(cached_class_names) > 0
+    cached_set = set(cached_class_names)
+    rice_present = any(name.startswith("Rice___") for name in cached_class_names)
+    plant_subset_ok = plant_classes.issubset(cached_set)
+    prefixes_ok = all(name.startswith(allowed_prefixes) for name in cached_class_names)
+    data_ready = (
+        len(cached_class_names) > 0
+        and rice_present
+        and plant_subset_ok
+        and prefixes_ok
+    )
 
     if not data_ready or force_download:
-        print("Downloading Kaggle dataset...")
+        print("Downloading Kaggle datasets...")
         try:
             import kagglehub
 
-            dataset_path = kagglehub.dataset_download("karagwaanntreasure/plant-disease-detection")
-            print(f"Dataset downloaded to: {dataset_path}")
-
-            plant_dir: str = ""
-            discovered_classes: List[str] = []
-            for root, dirs, _ in os.walk(dataset_path):
-                candidate_classes: List[str] = []
-                for d in dirs:
-                    full = os.path.join(root, d)
-                    if not os.path.isdir(full):
-                        continue
-                    try:
-                        entries = os.listdir(full)
-                    except OSError as exc:
-                        print(f"Warning: Cannot access {full}: {exc}")
-                        continue
-                    if any(
-                        os.path.isfile(os.path.join(full, f))
-                        and f.lower().endswith(image_exts)
-                        for f in entries
-                    ):
-                        candidate_classes.append(d)
-                if candidate_classes:
-                    plant_dir = root
-                    discovered_classes = sorted(candidate_classes)
-                    break
-
-            if not plant_dir:
-                raise ValueError(
-                    f"Could not locate class directories with images in {dataset_path}"
-                )
-
-            print(
-                f"Extracting {len(discovered_classes)} classes from {plant_dir}..."
+            plant_dataset_path = kagglehub.dataset_download(
+                "karagwaanntreasure/plant-disease-detection"
             )
+            print(f"Plant dataset downloaded to: {plant_dataset_path}")
+
+            rice_dataset_path = kagglehub.dataset_download(
+                "loki4514/rice-leaf-diseases-detection"
+            )
+            print(f"Rice dataset downloaded to: {rice_dataset_path}")
 
             if os.path.isdir(cache_dir):
                 shutil.rmtree(cache_dir)
             _ensure_dir(cache_dir)
 
-            for cls in discovered_classes:
-                src_dir = os.path.join(plant_dir, cls)
+            print("Extracting potato and tomato classes...")
+            for cls in sorted(plant_classes):
+                src_dir = _find_class_directory(plant_dataset_path, cls)
+                if not src_dir:
+                    print(f"  Warning: Class directory not found for {cls}")
+                    continue
                 dst_dir = os.path.join(cache_dir, cls)
-                _ensure_dir(dst_dir)
-                num_images = 0
-                for root, _, files in os.walk(src_dir):
-                    for name in files:
-                        if not name.lower().endswith(image_exts):
-                            continue
-                        src_path = os.path.join(root, name)
-                        base, ext = os.path.splitext(name)
-                        dst_path = os.path.join(dst_dir, name)
-                        suffix = 1
-                        while os.path.exists(dst_path):
-                            dst_path = os.path.join(dst_dir, f"{base}_{suffix}{ext}")
-                            suffix += 1
-                        shutil.copy2(src_path, dst_path)
-                        num_images += 1
-                if num_images == 0:
-                    print(f"  Warning: No images copied for class {cls}; removing directory")
+                copied = _copy_image_tree(src_dir, dst_dir, image_exts, clear_dst=True)
+                if copied == 0:
+                    print(f"  Warning: No images copied for {cls}; removing directory")
                     shutil.rmtree(dst_dir, ignore_errors=True)
                 else:
-                    print(f"  {cls}: {num_images} images")
+                    print(f"  {cls}: {copied} images")
+
+            print("Extracting rice classes...")
+            rice_class_sources: Dict[str, List[str]] = {}
+            rice_prefix = "Rice___"
+
+            for root, _, files in os.walk(rice_dataset_path):
+                image_files = [f for f in files if f.lower().endswith(image_exts)]
+                if not image_files:
+                    continue
+                class_token = _sanitize_label(os.path.basename(root))
+                if not class_token:
+                    continue
+                if class_token.lower().startswith(rice_prefix.lower()):
+                    class_name = rice_prefix + class_token[len(rice_prefix) :]
+                else:
+                    class_name = f"{rice_prefix}{class_token}"
+                rice_class_sources.setdefault(class_name, []).append(root)
+
+            if not rice_class_sources:
+                raise ValueError(
+                    "Could not locate rice class directories with images in the downloaded dataset."
+                )
+
+            for class_name in sorted(rice_class_sources):
+                dst_dir = os.path.join(cache_dir, class_name)
+                first_source = True
+                total_copied = 0
+                for src_dir in rice_class_sources[class_name]:
+                    copied = _copy_image_tree(
+                        src_dir,
+                        dst_dir,
+                        image_exts,
+                        clear_dst=first_source,
+                    )
+                    total_copied += copied
+                    first_source = False
+                if total_copied == 0:
+                    print(
+                        f"  Warning: No images copied for rice class {class_name}; removing directory"
+                    )
+                    shutil.rmtree(dst_dir, ignore_errors=True)
+                else:
+                    print(f"  {class_name}: {total_copied} images")
 
             cached_class_names = _list_cached_classes(cache_dir)
-            if not cached_class_names:
-                raise ValueError("No classes with images were cached. Please verify the dataset contents.")
+            cached_set = set(cached_class_names)
+            rice_present = any(name.startswith("Rice___") for name in cached_class_names)
+            if not cached_class_names or not rice_present or not plant_classes.issubset(cached_set):
+                raise ValueError(
+                    "Failed to prepare required classes. Please verify the downloaded datasets."
+                )
 
         except ImportError:
             raise ImportError(
@@ -489,7 +606,10 @@ def data_kaggle_plant_disease_all(cfg: Dict[str, Any]) -> DataSplits:
     X_all: List[np.ndarray] = []
     y_all: List[int] = []
 
-    class_names = sorted(cached_class_names)
+    class_names = sorted(_list_cached_classes(cache_dir))
+    if not class_names:
+        raise ValueError("No classes with images were cached. Please verify the dataset contents.")
+
     print(f"Loading images for {len(class_names)} classes...")
 
     for idx, cls in enumerate(class_names):
@@ -524,6 +644,10 @@ def data_kaggle_plant_disease_all(cfg: Dict[str, Any]) -> DataSplits:
 
     if len(X_all) == 0:
         raise ValueError("No images loaded. Please check the dataset.")
+
+    label_path = os.path.join(cache_dir, "label.txt")
+    with open(label_path, "w", encoding="utf-8") as label_file:
+        label_file.write("\n".join(class_names))
 
     X_all = np.stack(X_all, axis=0)
     y_all = np.asarray(y_all, dtype=np.int64)
@@ -700,7 +824,13 @@ register_model_builder("sequential_cnn_mnist", build_sequential_cnn_mnist)
 def build_mobilenet_v2_transfer(
     input_shape: Tuple[int, int, int], num_classes: int, cfg: Dict[str, Any]
 ) -> tf.keras.Model:
-    from tensorflow.keras import layers, models, optimizers, mixed_precision as mp
+    from tensorflow.keras import (
+        layers,
+        models,
+        optimizers,
+        mixed_precision as mp,
+        regularizers,
+    )
 
     if bool(cfg.get("mixed_precision", False)):
         try:
@@ -743,6 +873,13 @@ def build_mobilenet_v2_transfer(
     dense_units = int(cfg.get("dense_units", 128))
     opt_name = str(cfg.get("optimizer", "Adam"))
     lr = float(cfg.get("learning_rate", 0.0005))
+    dense_l2 = float(cfg.get("dense_l2", 0.0))
+    classifier_l2 = float(cfg.get("classifier_l2", dense_l2))
+
+    dense_regularizer = regularizers.l2(dense_l2) if dense_l2 > 0 else None
+    classifier_regularizer = (
+        regularizers.l2(classifier_l2) if classifier_l2 > 0 else None
+    )
 
     inputs = tf.keras.Input(shape=input_shape)
     x = inputs
@@ -756,8 +893,17 @@ def build_mobilenet_v2_transfer(
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
     if drop > 0:
         x = tf.keras.layers.Dropout(drop)(x)
-    x = tf.keras.layers.Dense(dense_units, activation="relu")(x)
-    outputs = tf.keras.layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
+    x = tf.keras.layers.Dense(
+        dense_units,
+        activation="relu",
+        kernel_regularizer=dense_regularizer,
+    )(x)
+    outputs = tf.keras.layers.Dense(
+        num_classes,
+        activation="softmax",
+        dtype="float32",
+        kernel_regularizer=classifier_regularizer,
+    )(x)
     model = tf.keras.Model(inputs, outputs, name="mobilenet_v2_transfer")
 
     if opt_name.lower() == "rmsprop":
@@ -769,7 +915,8 @@ def build_mobilenet_v2_transfer(
         if hasattr(opt, "learning_rate"):
             opt.learning_rate = lr
 
-    model.compile(optimizer=opt, loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    loss_obj = tf.keras.losses.SparseCategoricalCrossentropy()
+    model.compile(optimizer=opt, loss=loss_obj, metrics=["accuracy"])
     return model
 
 
@@ -783,7 +930,11 @@ register_model_builder("mobilenet_v2_transfer", build_mobilenet_v2_transfer)
 def train_basic(
     model: tf.keras.Model, splits: DataSplits, cfg: Dict[str, Any]
 ) -> Tuple[tf.keras.Model, Any]:
-    from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+    from tensorflow.keras.callbacks import (
+        ModelCheckpoint,
+        EarlyStopping,
+        ReduceLROnPlateau,
+    )
 
     epochs: int = int(cfg.get("epochs", 5))
     batch_size: int = int(cfg.get("batch_size", 32))
@@ -810,6 +961,25 @@ def train_basic(
     if use_validation:
         callbacks.append(EarlyStopping(monitor=monitor, patience=patience, restore_best_weights=True))
 
+    reduce_lr_cfg = cfg.get("reduce_lr_on_plateau", None)
+    if isinstance(reduce_lr_cfg, bool):
+        reduce_lr_cfg = {} if reduce_lr_cfg else None
+    if reduce_lr_cfg is not None:
+        reduce_lr_params = {
+            "monitor": monitor,
+            "factor": 0.3,
+            "patience": 3,
+            "min_lr": 3e-6,
+            "verbose": int(cfg.get("verbose", 1)) > 0,
+        }
+        if isinstance(reduce_lr_cfg, dict):
+            reduce_lr_params.update(reduce_lr_cfg)
+            reduce_lr_params.setdefault("monitor", monitor)
+        callbacks.append(ReduceLROnPlateau(**reduce_lr_params))
+
+    class_weight_cfg = cfg.get("class_weight")
+    class_weight = _prepare_class_weight(class_weight_cfg, splits.y_train)
+
     history = model.fit(
         splits.X_train,
         splits.y_train,
@@ -818,6 +988,7 @@ def train_basic(
         validation_data=(splits.X_val, splits.y_val) if use_validation and splits.X_val.size else None,
         callbacks=callbacks,
         verbose=int(cfg.get("verbose", 1)),
+        class_weight=class_weight,
     )
     return model, history
 
@@ -828,7 +999,11 @@ register_trainer("basic", train_basic)
 def train_tfdata(
     model: tf.keras.Model, splits: DataSplits, cfg: Dict[str, Any]
 ) -> Tuple[tf.keras.Model, Any]:
-    from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+    from tensorflow.keras.callbacks import (
+        ModelCheckpoint,
+        EarlyStopping,
+        ReduceLROnPlateau,
+    )
 
     if bool(cfg.get("xla", False)):
         try:
@@ -949,6 +1124,25 @@ def train_tfdata(
     if use_validation:
         callbacks.append(EarlyStopping(monitor=monitor, patience=patience, restore_best_weights=True))
 
+    reduce_lr_cfg = cfg.get("reduce_lr_on_plateau", None)
+    if isinstance(reduce_lr_cfg, bool):
+        reduce_lr_cfg = {} if reduce_lr_cfg else None
+    if reduce_lr_cfg is not None:
+        reduce_lr_params = {
+            "monitor": monitor,
+            "factor": 0.3,
+            "patience": 3,
+            "min_lr": 3e-6,
+            "verbose": int(cfg.get("verbose", 1)) > 0,
+        }
+        if isinstance(reduce_lr_cfg, dict):
+            reduce_lr_params.update(reduce_lr_cfg)
+            reduce_lr_params.setdefault("monitor", monitor)
+        callbacks.append(ReduceLROnPlateau(**reduce_lr_params))
+
+    class_weight_cfg = cfg.get("class_weight")
+    class_weight = _prepare_class_weight(class_weight_cfg, splits.y_train)
+
     history = model.fit(
         ds_train,
         epochs=epochs,
@@ -957,6 +1151,7 @@ def train_tfdata(
         validation_steps=cfg.get("validation_steps", None),
         callbacks=callbacks,
         verbose=int(cfg.get("verbose", 1)),
+        class_weight=class_weight,
     )
     return model, history
 
